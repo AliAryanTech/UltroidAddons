@@ -1,243 +1,156 @@
-# nhentai.py — Clean rebuild for Ultroid
-# Works with Weeb API: https://weeb-api.vercel.app
-# Requires: pillow, aiohttp
+# Ultroid Addon: nhentai downloader
+# Fixed PDF output + Progress updates (25-100%)
+# Use: .nhentai <code>
 
 import io
-import asyncio
-import aiohttp
-import re
+import requests
+from fpdf import FPDF
 from PIL import Image
 from telethon.tl.custom import Button
 
-from . import (
-    ultroid_cmd,
-    eor,
-    LOGS,
-    callback,
-)
+from . import ultroid_cmd, HNDLR
+from pyUltroid.fns.tools import cmd_regex_replace
+from pyUltroid.dB._core import HELP, LIST
 
-### API
-API_ALL = "https://weeb-api.vercel.app/nhentai-all?url={}"
-API_GET = "https://weeb-api.vercel.app/nhentai/get?url=https://nhentai.net/g/{}"
+HELP["Official"]["nhentai"] = [
+    f"**NHentai Downloader**\n\n"
+    f"`{HNDLR}nhentai <code>` — Download doujin as PDF\n"
+    f"`{HNDLR}nhentai-all <code>` — View chapters list\n"
+]
 
-SUPPORTED = {
-    "nhentai.com","nhentai.net","hentai2read.com","hentaiforce.net",
-    "www2.hentai2.net","hentaifox.com","hdporncomics.com","allporncomic.com",
-    "allporncomic.io","milftoon.xxx"
-}
-
-NH_SESSION = {}
+NH_API = "https://nhentai.net/api/gallery/"
 
 
-### Helpers
-def _resolve_api(q: str):
-    q = q.strip()
-    if q.isdigit():
-        return API_GET.format(q)
-    for domain in SUPPORTED:
-        if domain in q:
-            return API_ALL.format(q)
-    return None
+# ------------------------ PDF Converter --------------------------
+
+def create_pdf(images, title="nhentai"):
+    pdf = FPDF(unit="mm", format="A4")
+    pdf.set_auto_page_break(0)
+    
+    total = len(images)
+    done = 0
+    
+    for img_data in images:
+        pdf.add_page()
+        image = Image.open(io.BytesIO(img_data)).convert("RGB")
+        w, h = image.size
+
+        max_w, max_h = 210, 297  # A4 mm
+        ratio = min(max_w / w, max_h / h)
+        new_w, new_h = int(w * ratio), int(h * ratio)
+
+        # Save to temp
+        buf = io.BytesIO()
+        image.resize((new_w, new_h)).save(buf, format="JPEG")
+        buf.seek(0)
+
+        pdf.image(buf, x=0, y=0, w=new_w, h=new_h)
+
+        done += 1
+
+    # return bytes instead of writing file
+    return pdf.output(dest="S").encode("latin-1")
 
 
-async def _get_json(sess, url):
-    try:
-        async with sess.get(url, timeout=40) as r:
-            r.raise_for_status()
-            return await r.json()
-    except Exception:
-        LOGS.exception("JSON fetch failed: %s", url)
-        return None
+# ------------------------ Image Fetcher --------------------------
+
+async def fetch_images(gid, send_status):
+    meta = requests.get(NH_API + str(gid)).json()
+    
+    pages = meta["images"]["pages"]
+    media_id = meta["media_id"]
+    
+    imgs = []
+    total = len(pages)
+
+    # notify in 4 chunks
+    step_marks = { int(total*0.25): "25%", int(total*0.50): "50%", int(total*0.75): "75%" }
+
+    for i, page in enumerate(pages):
+        ext = { "j": "jpg", "p": "png", "g": "gif" }.get(page["t"], "jpg")
+        url = f"https://i.nhentai.net/galleries/{media_id}/{i+1}.{ext}"
+
+        img = requests.get(url).content
+        imgs.append(img)
+
+        if i in step_marks:
+            await send_status(step_marks[i])
+
+    return imgs, meta["title"]["english"]
 
 
-async def _get_img(sess, url):
-    try:
-        async with sess.get(url, timeout=90) as r:
-            r.raise_for_status()
-            return await r.read()
-    except Exception:
-        LOGS.exception("Image dl failed: %s", url)
-        return None
+# ------------------------ Commands --------------------------
+
+@ultroid_cmd(pattern="nhentai-all ?(.*)")
+async def nh_all(e):
+    gid = e.pattern_match.group(1).strip()
+    if not gid:
+        return await e.eor("Give nhentai code.\nExample: `.nhentai-all 40000`")
+
+    data = requests.get(NH_API + gid).json()
+    title = data["title"]["english"]
+    pages = len(data["images"]["pages"])
+
+    if pages <= 1:
+        return await e.eor(f"**{title}**\nOnly one chapter.\nUse `.nhentai {gid}`")
+
+    await e.eor(
+        f"**{title}**\nSelect to download:",
+        buttons=[
+            [Button.inline(f"Download ({pages} pages)", f"nhd_{gid}")]
+        ]
+    )
 
 
-def _make_pdf(img_bytes, title):
-    if not img_bytes:
-        return None
-
-    images = []
-    for b in img_bytes:
-        try:
-            im = Image.open(io.BytesIO(b))
-            if im.mode != "RGB":
-                im = im.convert("RGB")
-            images.append(im)
-        except:
-            pass
-
-    if not images:
-        return None
-
-    safe = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_"))[:120] or "file"
-    bio = io.BytesIO()
-    bio.name = f"{safe}.pdf"
-
-    try:
-        images[0].save(bio, "PDF", save_all=True, append_images=images[1:])
-        bio.seek(0)
-        return bio
-    except:
-        LOGS.exception("PDF failed")
-        return None
-
-
-async def _download_with_progress(msg, sess, urls):
-    total = len(urls)
-    sem = asyncio.Semaphore(8)
-
-    chunks = 5  # 20/40/60/80/100
-    marks = [(i * (100 // chunks)) for i in range(1, chunks + 1)]
-    last_mark = 0
-
-    async def _dl(url, idx):
-        async with sem:
-            return idx, await _get_img(sess, url)
-
-    tasks = [asyncio.create_task(_dl(url, i)) for i, url in enumerate(urls)]
-    results = []
-
-    for i, t in enumerate(asyncio.as_completed(tasks), start=1):
-        res = await t
-        if res and res[1]:
-            results.append(res)
-
-        pct = (i / total) * 100
-        for m in marks:
-            if pct >= m > last_mark:
-                last_mark = m
-                await msg.edit(f"`Downloading… {m}%`")
-                break
-
-    results.sort(key=lambda x: x[0])
-    return [b for _, b in results]
-
-
-### Command
 @ultroid_cmd(pattern="nhentai ?(.*)")
-async def _(e):
-    q = e.pattern_match.group(1).strip()
-    if not q:
-        return await eor(e, "`Usage: .nhentai <id|url>`")
+async def nhentai_cmd(e):
+    gid = e.pattern_match.group(1).strip()
+    if not gid:
+        return await e.eor("Send NHentai code.\nExample: `.nhentai 40000`")
 
-    api = _resolve_api(q)
-    if not api:
-        return await eor(e, "`Unsupported link or code.`")
+    msg = await e.eor(f"📥 Fetching `{gid}` metadata...")
 
-    msg = await eor(e, "`Fetching...`")
+    async def status(p):
+        await msg.edit(f"📥 Downloading pages...\nProgress: **{p}**")
 
-    async with aiohttp.ClientSession() as sess:
-        data = await _get_json(sess, api)
-        if not data:
-            return await msg.edit("`API failed.`")
+    try:
+        imgs, title = await fetch_images(gid, status)
+        await msg.edit(f"📚 Creating PDF...\nProcessing: **100%** ✅")
 
-        title = data.get("title") or "untitled"
-        imgs = data.get("images") or []
-        chapters = data.get("chapterList")
+        pdf_bytes = create_pdf(imgs, title)
 
-        # No chapterList → send single PDF
-        if not chapters:
-            if not imgs:
-                return await msg.edit("`No images found.``")
+        await e.client.send_file(
+            e.chat_id,
+            io.BytesIO(pdf_bytes),
+            file_name=f"{gid}.pdf",
+            caption=f"✅ **{title}**\nNHentai `{gid}`"
+        )
 
-            img_bytes = await _download_with_progress(msg, sess, imgs)
-            if not img_bytes:
-                return await msg.edit("`Images failed.`")
+        await msg.delete()
 
-            await msg.edit("`Building PDF...`")
-            pdf = _make_pdf(img_bytes, title)
-            if not pdf:
-                return await msg.edit("`PDF error.`")
-
-            await e.client.send_file(e.chat_id, pdf, caption=title, force_document=True, reply_to=e.reply_to_msg_id)
-            return await msg.delete()
-
-        # Single chapter behavior → auto download
-        if len(chapters) == 1:
-            if imgs:
-                img_bytes = await _download_with_progress(msg, sess, imgs)
-                if not img_bytes:
-                    return await msg.edit("`Images failed.`")
-
-                await msg.edit("`Building PDF...`")
-                pdf = _make_pdf(img_bytes, title)
-                await e.client.send_file(e.chat_id, pdf, caption=title, force_document=True, reply_to=e.reply_to_msg_id)
-                return await msg.delete()
-
-            ch = chapters[0]
-            link = ch.get("link")
-            if not link:
-                return await msg.edit("`Invalid chapter link.`")
-
-            await msg.edit("`Fetching chapter...`")
-            d = await _get_json(sess, API_ALL.format(link))
-            imgs = d.get("images") or []
-            if not imgs:
-                return await msg.edit("`No pages.`")
-
-            img_bytes = await _download_with_progress(msg, sess, imgs)
-            await msg.edit("`Building PDF...`")
-            pdf = _make_pdf(img_bytes, ch.get("title") or title)
-            await e.client.send_file(e.chat_id, pdf, caption=ch.get("title"), force_document=True, reply_to=e.reply_to_msg_id)
-            return await msg.delete()
-
-        # Multi chapter → send full gallery then buttons
-        if imgs:
-            img_bytes = await _download_with_progress(msg, sess, imgs)
-            if img_bytes:
-                await msg.edit("`Building Full PDF...`")
-                pdf = _make_pdf(img_bytes, title)
-                if pdf:
-                    await e.client.send_file(e.chat_id, pdf, caption=f"{title} (full)", force_document=True, reply_to=e.reply_to_msg_id)
-
-        NH_SESSION[e.sender_id] = {"chapters": chapters}
-
-        buttons = []
-        for i, ch in enumerate(chapters):
-            nm = ch.get("title") or f"Chapter {i+1}"
-            pg = f" ({ch.get('pages')}p)" if isinstance(ch.get("pages"), int) else ""
-            buttons.append([Button.inline(f"{nm}{pg}"[:64], data=f"nhc|{e.sender_id}|{i}")])
-
-        return await msg.edit(f"**{title}**\nSelect chapter:", buttons=buttons)
+    except Exception as er:
+        await msg.edit(f"❌ Error\n`{er}`")
 
 
-### Callback
-@callback(re.compile(r"nhc\|(\d+)\|(\d+)"), owner=False)
-async def _(e):
-    orig, idx = map(int, e.pattern_match.groups())
-    if e.sender_id != orig:
-        return await e.answer("Not your request.", alert=True)
+# ------------------ Inline handler for nhentai-all button ------------------
 
-    s = NH_SESSION.get(orig)
-    if not s:
-        return await e.answer("Session expired.", alert=True)
+from telethon import events
 
-    chs = s["chapters"]
-    if idx >= len(chs):
-        return await e.answer("Invalid.", alert=True)
+@events.register(events.CallbackQuery(pattern=r"nhd_(.*)"))
+async def _(event):
+    gid = event.pattern_match.group(1)
+    m = await event.edit(f"📥 Starting download `{gid}`")
 
-    ch = chs[idx]
-    link = ch.get("link")
-    title = ch.get("title") or f"chapter-{idx+1}"
+    async def status(p):
+        await m.edit(f"📥 Pages downloading: **{p}**")
 
-    await e.edit(f"`Fetching {title}...`")
-    async with aiohttp.ClientSession() as sess:
-        d = await _get_json(sess, API_ALL.format(link))
-        imgs = d.get("images") or []
+    imgs, title = await fetch_images(gid, status)
+    pdf_bytes = create_pdf(imgs, title)
 
-        img_bytes = await _download_with_progress(e, sess, imgs)
-        await e.edit("`Building PDF...`")
-        pdf = _make_pdf(img_bytes, title)
-
-        await e.client.send_file(e.chat_id, pdf, caption=title, force_document=True)
-        await e.delete()
-
-    NH_SESSION.pop(orig, None)
+    await event.client.send_file(
+        event.chat_id,
+        io.BytesIO(pdf_bytes),
+        file_name=f"{gid}.pdf",
+        caption=f"✅ **{title}**"
+    )
+    await m.delete()
