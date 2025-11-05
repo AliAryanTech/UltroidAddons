@@ -1,156 +1,152 @@
-# Ultroid Addon: nhentai downloader
-# Fixed PDF output + Progress updates (25-100%)
-# Use: .nhentai <code>
+# Ultroid addon: NHentai downloader
+# Dumb bots break, smart bots read instructions.
 
+import os
 import io
 import requests
-from fpdf import FPDF
+from telethon import Button
 from PIL import Image
-from telethon.tl.custom import Button
+from fpdf import FPDF
+from . import ultroid_cmd
 
-from . import ultroid_cmd, HNDLR
-from pyUltroid.fns.tools import cmd_regex_replace
-from pyUltroid.dB._core import HELP, LIST
-
-HELP["Official"]["nhentai"] = [
-    f"**NHentai Downloader**\n\n"
-    f"`{HNDLR}nhentai <code>` — Download doujin as PDF\n"
-    f"`{HNDLR}nhentai-all <code>` — View chapters list\n"
-]
-
-NH_API = "https://nhentai.net/api/gallery/"
+API_ALL = "https://weeb-api.vercel.app/nhentai-all?url="
+API_GET = "https://weeb-api.vercel.app/nhentai/get?url=https://nhentai.net/g/{}"
 
 
-# ------------------------ PDF Converter --------------------------
+def build_pdf(images, title):
+    pdf = FPDF(unit="pt", format="A4")
+    for img_bytes in images:
+        img = Image.open(io.BytesIO(img_bytes))
+        w, h = img.size
 
-def create_pdf(images, title="nhentai"):
-    pdf = FPDF(unit="mm", format="A4")
-    pdf.set_auto_page_break(0)
-    
-    total = len(images)
-    done = 0
-    
-    for img_data in images:
         pdf.add_page()
-        image = Image.open(io.BytesIO(img_data)).convert("RGB")
-        w, h = image.size
-
-        max_w, max_h = 210, 297  # A4 mm
-        ratio = min(max_w / w, max_h / h)
-        new_w, new_h = int(w * ratio), int(h * ratio)
-
-        # Save to temp
-        buf = io.BytesIO()
-        image.resize((new_w, new_h)).save(buf, format="JPEG")
-        buf.seek(0)
-
-        pdf.image(buf, x=0, y=0, w=new_w, h=new_h)
-
-        done += 1
-
-    # return bytes instead of writing file
-    return pdf.output(dest="S").encode("latin-1")
-
-
-# ------------------------ Image Fetcher --------------------------
-
-async def fetch_images(gid, send_status):
-    meta = requests.get(NH_API + str(gid)).json()
+        # resize keeping ratio to page width
+        ratio = 595 / w
+        nh = h * ratio
+        img = img.resize((595, int(nh)))
+        temp = io.BytesIO()
+        img.save(temp, format="JPEG")
+        temp.seek(0)
+        pdf.image(temp, 0, 0, 595, int(nh))
     
-    pages = meta["images"]["pages"]
-    media_id = meta["media_id"]
-    
+    memory_file = io.BytesIO()
+    pdf.output(memory_file, "F")
+    memory_file.seek(0)
+    return memory_file
+
+
+async def fetch_images(url):
+    r = requests.get(url).json()
+    title = r.get("title")
+    chapters = r.get("chapters")
+    images = []
+
+    if chapters and len(chapters) > 1:
+        return "MULTI", title, chapters
+
+    # single chapter
+    for img in r.get("images", []):
+        images.append(requests.get(img).content)
+
+    return "SINGLE", title, images
+
+
+async def dl_chapter(chapter):
     imgs = []
-    total = len(pages)
-
-    # notify in 4 chunks
-    step_marks = { int(total*0.25): "25%", int(total*0.50): "50%", int(total*0.75): "75%" }
-
-    for i, page in enumerate(pages):
-        ext = { "j": "jpg", "p": "png", "g": "gif" }.get(page["t"], "jpg")
-        url = f"https://i.nhentai.net/galleries/{media_id}/{i+1}.{ext}"
-
-        img = requests.get(url).content
-        imgs.append(img)
-
-        if i in step_marks:
-            await send_status(step_marks[i])
-
-    return imgs, meta["title"]["english"]
+    for img in chapter.get("images", []):
+        imgs.append(requests.get(img).content)
+    return imgs
 
 
-# ------------------------ Commands --------------------------
-
-@ultroid_cmd(pattern="nhentai-all ?(.*)")
-async def nh_all(e):
-    gid = e.pattern_match.group(1).strip()
-    if not gid:
-        return await e.eor("Give nhentai code.\nExample: `.nhentai-all 40000`")
-
-    data = requests.get(NH_API + gid).json()
-    title = data["title"]["english"]
-    pages = len(data["images"]["pages"])
-
-    if pages <= 1:
-        return await e.eor(f"**{title}**\nOnly one chapter.\nUse `.nhentai {gid}`")
-
-    await e.eor(
-        f"**{title}**\nSelect to download:",
-        buttons=[
-            [Button.inline(f"Download ({pages} pages)", f"nhd_{gid}")]
-        ]
-    )
+def split_progress(total, stage):
+    return f"📥 Downloading… {int((stage/5)*100)}%"
 
 
 @ultroid_cmd(pattern="nhentai ?(.*)")
-async def nhentai_cmd(e):
-    gid = e.pattern_match.group(1).strip()
-    if not gid:
-        return await e.eor("Send NHentai code.\nExample: `.nhentai 40000`")
+async def nhentai_cmd(event):
+    q = event.pattern_match.group(1).strip()
+    if not q:
+        return await event.eor("Give code or NHentai link.")
 
-    msg = await e.eor(f"📥 Fetching `{gid}` metadata...")
+    # Detect if input is link or code
+    if q.isdigit():
+        url = API_GET.format(q)
+    elif "nhentai.net" in q:
+        url = API_ALL + q
+    else:
+        return await event.eor("Invalid input.")
 
-    async def status(p):
-        await msg.edit(f"📥 Downloading pages...\nProgress: **{p}**")
+    msg = await event.eor("Fetching info…")
 
-    try:
-        imgs, title = await fetch_images(gid, status)
-        await msg.edit(f"📚 Creating PDF...\nProcessing: **100%** ✅")
+    mode, title, data = await fetch_images(url)
 
-        pdf_bytes = create_pdf(imgs, title)
+    # MULTI CHAPTER HANDLING
+    if mode == "MULTI":
+        buttons = []
+        for i, chap in enumerate(data):
+            chap_id = chap.get("id", i)
+            buttons.append(
+                [Button.inline(f"📄 Chapter {i+1}", f"nhchap_{chap_id}")]
+            )
 
-        await e.client.send_file(
-            e.chat_id,
-            io.BytesIO(pdf_bytes),
-            file_name=f"{gid}.pdf",
-            caption=f"✅ **{title}**\nNHentai `{gid}`"
-        )
+        # Download first chapter PDF
+        ch_imgs = await dl_chapter(data[0])
+        pdf = build_pdf(ch_imgs, title)
 
-        await msg.delete()
+        await msg.edit(f"✅ **{title}**\nMultiple chapters found.\nSending first chapter...")
+        await event.client.send_file(event.chat_id, pdf, caption=f"**{title} — Ch 1**", force_document=True, buttons=buttons)
+        return
 
-    except Exception as er:
-        await msg.edit(f"❌ Error\n`{er}`")
+    # SINGLE CHAPTER
+    # data = images list
+    imgs = data
+    total = len(imgs)
+    batch = max(1, total // 5)
+
+    downloaded = []
+    for i, img in enumerate(imgs):
+        downloaded.append(img)
+        if (i+1) % batch == 0 or i+1 == total:
+            stage = min(5, len(downloaded) // batch)
+            await msg.edit(split_progress(total, stage))
+
+    pdf = build_pdf(downloaded, title)
+
+    await msg.edit("✅ 100% Completed. Sending file…")
+    await event.client.send_file(event.chat_id, pdf, caption=f"**{title}**", force_document=True)
 
 
-# ------------------ Inline handler for nhentai-all button ------------------
+# Callback for chapters
+@ultroid_cmd(incoming=True)
+async def cb_handler(event):
+    if not event.data.startswith(b"nhchap_"):
+        return
 
-from telethon import events
+    chap_id = event.data.decode().split("_",1)[1]
+    await event.answer("Processing…")
 
-@events.register(events.CallbackQuery(pattern=r"nhd_(.*)"))
-async def _(event):
-    gid = event.pattern_match.group(1)
-    m = await event.edit(f"📥 Starting download `{gid}`")
+    # fetch chapter list again (user originally sent URL)
+    original = (await event.get_reply_message()).message
+    link = ''.join([x for x in original.split() if "nhentai.net" in x])
 
-    async def status(p):
-        await m.edit(f"📥 Pages downloading: **{p}**")
+    mode, title, data = await fetch_images(API_ALL + link)
 
-    imgs, title = await fetch_images(gid, status)
-    pdf_bytes = create_pdf(imgs, title)
+    chapter = next((c for c in data if str(c.get("id")) == chap_id), None)
+    if not chapter:
+        return await event.edit("Chapter not found.")
 
-    await event.client.send_file(
-        event.chat_id,
-        io.BytesIO(pdf_bytes),
-        file_name=f"{gid}.pdf",
-        caption=f"✅ **{title}**"
-    )
-    await m.delete()
+    imgs = await dl_chapter(chapter)
+
+    msg = await event.respond(f"📥 Downloading chapter {chap_id}…")
+    total = len(imgs)
+    batch = max(1, total//5)
+
+    downloaded = []
+    for i, img in enumerate(imgs):
+        downloaded.append(img)
+        if (i+1) % batch == 0 or i+1 == total:
+            stage = min(5, len(downloaded)//batch)
+            await msg.edit(split_progress(total, stage))
+
+    pdf = build_pdf(downloaded, title)
+    await event.client.send_file(event.chat_id, pdf, caption=f"**{title} — Chapter**", force_document=True)
