@@ -72,21 +72,25 @@ async def create_pdf_from_images(images_data, title="NHentai"):
         return None
 
 
-@ultroid_cmd(pattern="nhentai( (.*)|$)")
+@ultroid_cmd(pattern="nhentai$")
+async def nhentai_help(event):
+    """Show nhentai help message."""
+    await eor(
+        event,
+        "**Usage:** `.nhentai <digits>` or `.nhentai <url>`\n"
+        "**Example:** `.nhentai 177013` or `.nhentai https://nhentai.net/g/177013/`"
+    )
+
+
+@ultroid_cmd(pattern="nhentai (.*)")
 async def nhentai_download(event):
     """Download manga from NHentai and supported sites."""
     if not Image:
         return await eor(event, "`PIL is not installed. Cannot create PDF.`")
     
-    input_text = event.pattern_match.group(2)
+    input_text = event.pattern_match.group(1).strip()
     if not input_text:
-        return await eor(
-            event,
-            "**Usage:** `.nhentai <digits>` or `.nhentai <url>`\n"
-            "**Example:** `.nhentai 177013` or `.nhentai https://nhentai.net/g/177013/`"
-        )
-    
-    input_text = input_text.strip()
+        return
     
     # Determine if input is digits only or URL
     is_digits = re.match(r"^\d+$", input_text)
