@@ -22,8 +22,9 @@ except ImportError:
     Image = None
 
 from telethon import Button
+from telethon.tl.types import DocumentAttributeFilename
 
-from . import ultroid_cmd, async_searcher, eor, get_string, LOGS
+from . import ultroid_cmd, async_searcher, eor, get_string, LOGS, callback
 
 
 async def download_image(url):
@@ -77,13 +78,15 @@ async def nhentai_download(event):
     if not Image:
         return await eor(event, "`PIL is not installed. Cannot create PDF.`")
     
-    input_text = event.pattern_match.group(1).strip()
+    input_text = event.pattern_match.group(2)
     if not input_text:
         return await eor(
             event,
             "**Usage:** `.nhentai <digits>` or `.nhentai <url>`\n"
             "**Example:** `.nhentai 177013` or `.nhentai https://nhentai.net/g/177013/`"
         )
+    
+    input_text = input_text.strip()
     
     # Determine if input is digits only or URL
     is_digits = re.match(r"^\d+$", input_text)
@@ -144,10 +147,13 @@ async def nhentai_download(event):
         if idx == int(total_images * 0.2) or idx == int(total_images * 0.4) or \
            idx == int(total_images * 0.6) or idx == int(total_images * 0.8) or \
            idx == total_images:
-            await xx.edit(
-                f"**Downloading {total_images} pages{chapter_info}...**\n"
-                f"`Progress: {int(progress)}% ({idx}/{total_images})`"
-            )
+            try:
+                await xx.edit(
+                    f"**Downloading {total_images} pages{chapter_info}...**\n"
+                    f"`Progress: {int(progress)}% ({idx}/{total_images})`"
+                )
+            except Exception:
+                pass
     
     if not images_data:
         return await xx.edit("`Failed to download images.`")
@@ -170,7 +176,6 @@ async def nhentai_download(event):
         buttons = []
         for idx in range(1, total_chapters):
             ch_num = idx + 1
-            ch_title = data[idx].get("title", f"Chapter {ch_num}")
             # Create button data - store chapter index and original URL
             button_data = f"nhget_{idx}_{input_text}"
             buttons.append([Button.inline(f"📖 Chapter {ch_num}", data=button_data)])
@@ -184,10 +189,7 @@ async def nhentai_download(event):
             caption=caption,
             reply_to=event.reply_to_msg_id,
             buttons=buttons,
-            attributes=[{
-                "_": "DocumentAttributeFilename",
-                "file_name": filename
-            }]
+            attributes=[DocumentAttributeFilename(filename)]
         )
     else:
         await event.client.send_file(
@@ -196,23 +198,18 @@ async def nhentai_download(event):
             force_document=True,
             caption=caption,
             reply_to=event.reply_to_msg_id,
-            attributes=[{
-                "_": "DocumentAttributeFilename",
-                "file_name": filename
-            }]
+            attributes=[DocumentAttributeFilename(filename)]
         )
     
     await xx.delete()
 
 
 # Callback handler for chapter buttons
+@callback("nhget_")
 async def nhentai_callback(event):
     """Handle chapter download callbacks."""
-    if not event.data.startswith(b"nhget_"):
-        return
-    
     try:
-        _, chapter_idx, original_url = event.data.decode().split("_", 2)
+        _, chapter_idx, original_url = event.data_match.group(1).decode().split("_", 2)
         chapter_idx = int(chapter_idx)
     except Exception:
         return await event.answer("Invalid button data", alert=True)
@@ -243,7 +240,10 @@ async def nhentai_callback(event):
         return await event.answer("No images found", alert=True)
     
     # Send initial message
-    msg = await event.edit(f"**Downloading Chapter {chapter_idx + 1}**\n`Pages: {len(images)}`\n`Progress: 0%`")
+    try:
+        msg = await event.edit(f"**Downloading Chapter {chapter_idx + 1}**\n`Pages: {len(images)}`\n`Progress: 0%`")
+    except Exception:
+        msg = await event.respond(f"**Downloading Chapter {chapter_idx + 1}**\n`Pages: {len(images)}`\n`Progress: 0%`")
     
     images_data = []
     total_images = len(images)
@@ -256,11 +256,14 @@ async def nhentai_callback(event):
         if idx == int(total_images * 0.2) or idx == int(total_images * 0.4) or \
            idx == int(total_images * 0.6) or idx == int(total_images * 0.8) or \
            idx == total_images:
-            await msg.edit(
-                f"**Downloading Chapter {chapter_idx + 1}**\n"
-                f"`Pages: {len(images)}`\n"
-                f"`Progress: {int(progress)}% ({idx}/{total_images})`"
-            )
+            try:
+                await msg.edit(
+                    f"**Downloading Chapter {chapter_idx + 1}**\n"
+                    f"`Pages: {len(images)}`\n"
+                    f"`Progress: {int(progress)}% ({idx}/{total_images})`"
+                )
+            except Exception:
+                pass
     
     await msg.edit("`Creating PDF...`")
     pdf_buffer = await create_pdf_from_images(images_data, title)
@@ -277,9 +280,7 @@ async def nhentai_callback(event):
         force_document=True,
         caption=f"**{title}**\n`Chapter {chapter_idx + 1} - Pages: {len(images_data)}`",
         reply_to=event.message.reply_to_msg_id,
-        attributes=[{
-            "_": "DocumentAttributeFilename",
-            "file_name": filename
-        }]
+        attributes=[DocumentAttributeFilename(filename)]
     )
     await msg.delete()
+    
