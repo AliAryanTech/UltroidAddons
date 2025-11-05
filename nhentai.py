@@ -1,16 +1,21 @@
 # Ultroid - UserBot
+# Copyright (C) 2021-2025 TeamUltroid
 #
-# This file is a part of < https://github.com/TeamUltroid/UltroidAddons/>
-
+# This file is a part of < https://github.com/TeamUltroid/Ultroid/ >
+# PLease read the GNU Affero General Public License in
+# <https://www.github.com/TeamUltroid/Ultroid/blob/main/LICENSE/>.
 """
-Fetch manga from NHentai
+✘ Commands Available -
 
-Commands:
 • `{i}nhentai <digits/url>`
     Download manga from NHentai as PDF.
     - Use digits only (e.g., 177013) for single chapter
-    - Use full URL for multi-chapter support
+    - Use full URL for multi-chapter support (supports multiple sites)
 """
+
+from . import get_help
+
+__doc__ = get_help("help_nhentai")
 
 import os
 import re
@@ -20,22 +25,30 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+    LOGS.info(f"{__file__}: PIL not Installed.")
 
-from . import ultroid_cmd, async_searcher, eor, get_string, LOGS
+from telethon.tl.types import DocumentAttributeFilename
+
+from pyUltroid.fns.tools import create_tl_btn, get_msg_button
+
+from . import LOGS, eor, get_string, ultroid_cmd
+from ._inline import something
 
 
-async def download_image(url):
+async def download_image(session, url):
     """Download image from URL."""
     try:
-        img_data = await async_searcher(url, re_content=True)
-        return img_data
+        import aiohttp
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                return await resp.read()
     except Exception as e:
         LOGS.error(f"Error downloading image: {e}")
-        return None
+    return None
 
 
 async def create_pdf_from_images(images_data, title="NHentai"):
-    """Create PDF from image data list and save to file."""
+    """Create PDF from image data list."""
     if not images_data or not Image:
         return None
     
@@ -53,19 +66,17 @@ async def create_pdf_from_images(images_data, title="NHentai"):
         if not pdf_images:
             return None
         
-        # Create filename
-        filename = f"{title[:50]}.pdf" if len(title) > 50 else f"{title}.pdf"
-        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-        
-        # Save to file
+        pdf_buffer = BytesIO()
         pdf_images[0].save(
-            filename,
+            pdf_buffer,
             "PDF",
             resolution=100.0,
             save_all=True,
             append_images=pdf_images[1:] if len(pdf_images) > 1 else []
         )
-        return filename
+        pdf_buffer.seek(0)
+        pdf_buffer.name = "manga.pdf"
+        return pdf_buffer
     except Exception as e:
         LOGS.error(f"Error creating PDF: {e}")
         return None
@@ -87,98 +98,129 @@ async def nhentai_download(event):
     
     # Determine if input is digits only or URL
     is_digits = re.match(r"^\d+$", input_text)
-    is_url = input_text.startswith(("http://", "https://"))
-    
-    if not is_digits and not is_url:
-        return await eor(event, "`Invalid input. Provide NHentai digits or full URL.`")
     
     xx = await eor(event, get_string("com_1"))
     
     # Prepare API endpoint
     if is_digits:
         api_url = f"https://weeb-api.vercel.app/nhentai/get?url=https://nhentai.net/g/{input_text}"
+        is_multi = False
     else:
-        # URL encode the input
-        import urllib.parse
-        encoded_url = urllib.parse.quote(input_text, safe='')
-        api_url = f"https://weeb-api.vercel.app/nhentai-all?url={encoded_url}"
+        api_url = f"https://weeb-api.vercel.app/nhentai-all?url={input_text}"
+        is_multi = True
     
     # Fetch data
     try:
-        data = await async_searcher(api_url, re_json=True)
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    content_type = resp.headers.get('Content-Type', '')
+                    if 'application/json' in content_type:
+                        data = await resp.json()
+                    else:
+                        text = await resp.text()
+                        return await xx.edit(f"`Error: {text}`")
+                else:
+                    return await xx.edit(f"`API returned status code: {resp.status}`")
     except Exception as e:
         LOGS.error(f"API Error: {e}")
-        return await xx.edit("`Failed to fetch data from NHentai API.`")
+        return await xx.edit(f"`Failed to fetch data: {str(e)}`")
     
     if not data:
         return await xx.edit("`No data found.`")
     
-    # Handle response (single or multi chapter)
+    # Handle response
     if isinstance(data, list):
         if len(data) == 0:
             return await xx.edit("`No chapters found.`")
-        # For multi-chapter, only download first one
         chapter_data = data[0]
         total_chapters = len(data)
-        chapter_info = f" (Chapter 1/{total_chapters})" if total_chapters > 1 else ""
     else:
         chapter_data = data
-        chapter_info = ""
         total_chapters = 1
     
-    title = chapter_data.get("title", "NHentai")
+    title = chapter_data.get("title", "NHentai Manga")
     images = chapter_data.get("images", [])
     
     if not images:
         return await xx.edit("`No images found.`")
     
     total_images = len(images)
+    chapter_info = f" - Chapter 1/{total_chapters}" if total_chapters > 1 else ""
     await xx.edit(f"**Downloading {total_images} pages{chapter_info}...**\n`Progress: 0%`")
     
+    # Download images
     images_data = []
-    for idx, img_url in enumerate(images, 1):
-        img_data = await download_image(img_url)
-        if img_data:
-            images_data.append(img_data)
-        
-        # Update progress at 20%, 40%, 60%, 80%, 100%
-        progress = (idx / total_images) * 100
-        if idx == int(total_images * 0.2) or idx == int(total_images * 0.4) or \
-           idx == int(total_images * 0.6) or idx == int(total_images * 0.8) or \
-           idx == total_images:
-            await xx.edit(
-                f"**Downloading {total_images} pages{chapter_info}...**\n"
-                f"`Progress: {int(progress)}% ({idx}/{total_images})`"
-            )
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        for idx, img_url in enumerate(images, 1):
+            img_data = await download_image(session, img_url)
+            if img_data:
+                images_data.append(img_data)
+            
+            # Update progress at 20%, 40%, 60%, 80%, 100%
+            progress = (idx / total_images) * 100
+            if idx == int(total_images * 0.2) or idx == int(total_images * 0.4) or \
+               idx == int(total_images * 0.6) or idx == int(total_images * 0.8) or \
+               idx == total_images:
+                await xx.edit(
+                    f"**Downloading {total_images} pages{chapter_info}...**\n"
+                    f"`Progress: {int(progress)}% ({idx}/{total_images})`"
+                )
     
     if not images_data:
-        return await xx.edit("`Failed to download images.`")
+        return await xx.edit("`Failed to download any images.`")
     
     await xx.edit("`Creating PDF...`")
-    pdf_file = await create_pdf_from_images(images_data, title)
+    pdf_buffer = await create_pdf_from_images(images_data, title)
     
-    if not pdf_file:
+    if not pdf_buffer:
         return await xx.edit("`Failed to create PDF.`")
     
-    # Prepare caption
-    caption = f"**{title}**{chapter_info}\n`Pages: {len(images_data)}`"
+    # Create filename
+    safe_title = re.sub(r'[<>:"/\\|?*]', '', title)
     if total_chapters > 1:
-        caption += f"\n\n_Note: {total_chapters} chapters available. Use same command for each chapter._"
+        filename = f"{safe_title[:50]} - Ch1.pdf" if len(safe_title) > 50 else f"{safe_title} - Ch1.pdf"
+    else:
+        filename = f"{safe_title[:50]}.pdf" if len(safe_title) > 50 else f"{safe_title}.pdf"
     
-    try:
+    # Prepare caption
+    caption = f"**{title}**"
+    if total_chapters > 1:
+        caption += f"\n`Chapter 1/{total_chapters} - Pages: {len(images_data)}`"
+    else:
+        caption += f"\n`Pages: {len(images_data)}`"
+    
+    # Handle multi-chapter with buttons
+    if total_chapters > 1:
+        buttons = []
+        for idx in range(2, total_chapters + 1):
+            ch_data = data[idx - 1]
+            ch_title = ch_data.get("title", f"Chapter {idx}")
+            # Create button text and callback data
+            button_text = f"Chapter {idx}"
+            # Store the chapter data in a way that can be retrieved
+            buttons.append([button_text, f"nhget_{idx}_{input_text}"])
+        
+        tl_buttons = create_tl_btn(buttons) if buttons else None
+        
+        await something(
+            event,
+            caption,
+            pdf_buffer,
+            tl_buttons
+        )
+        await xx.delete()
+    else:
+        # Single chapter - send normally
         await event.client.send_file(
             event.chat_id,
-            pdf_file,
+            pdf_buffer,
+            attributes=[DocumentAttributeFilename(file_name=filename)],
             force_document=True,
             caption=caption,
             reply_to=event.reply_to_msg_id
         )
         await xx.delete()
-    except Exception as e:
-        LOGS.error(f"Error sending file: {e}")
-        await xx.edit("`Failed to send PDF file.`")
-    finally:
-        # Clean up
-        if os.path.exists(pdf_file):
-            os.remove(pdf_file)
-            
+        
