@@ -12,6 +12,7 @@ Commands:
     - Use full URL for multi-chapter support
 """
 
+import os
 import re
 from io import BytesIO
 
@@ -34,7 +35,7 @@ async def download_image(url):
 
 
 async def create_pdf_from_images(images_data, title="NHentai"):
-    """Create PDF from image data list."""
+    """Create PDF from image data list and save to file."""
     if not images_data or not Image:
         return None
     
@@ -52,16 +53,19 @@ async def create_pdf_from_images(images_data, title="NHentai"):
         if not pdf_images:
             return None
         
-        pdf_buffer = BytesIO()
+        # Create filename
+        filename = f"{title[:50]}.pdf" if len(title) > 50 else f"{title}.pdf"
+        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+        
+        # Save to file
         pdf_images[0].save(
-            pdf_buffer,
+            filename,
             "PDF",
             resolution=100.0,
             save_all=True,
             append_images=pdf_images[1:] if len(pdf_images) > 1 else []
         )
-        pdf_buffer.seek(0)
-        return pdf_buffer
+        return filename
     except Exception as e:
         LOGS.error(f"Error creating PDF: {e}")
         return None
@@ -78,12 +82,12 @@ async def nhentai_download(event):
         return await eor(
             event,
             "**Usage:** `.nhentai <digits>` or `.nhentai <url>`\n"
-            "**Example:** `.nhentai 177013`"
+            "**Example:** `.nhentai 177013` or `.nhentai https://nhentai.net/g/177013/`"
         )
     
-    # Determine if input is digits only or full URL
+    # Determine if input is digits only or URL
     is_digits = re.match(r"^\d+$", input_text)
-    is_url = "nhentai.net/g/" in input_text
+    is_url = input_text.startswith(("http://", "https://"))
     
     if not is_digits and not is_url:
         return await eor(event, "`Invalid input. Provide NHentai digits or full URL.`")
@@ -94,7 +98,10 @@ async def nhentai_download(event):
     if is_digits:
         api_url = f"https://weeb-api.vercel.app/nhentai/get?url=https://nhentai.net/g/{input_text}"
     else:
-        api_url = f"https://weeb-api.vercel.app/nhentai-all?url={input_text}"
+        # URL encode the input
+        import urllib.parse
+        encoded_url = urllib.parse.quote(input_text, safe='')
+        api_url = f"https://weeb-api.vercel.app/nhentai-all?url={encoded_url}"
     
     # Fetch data
     try:
@@ -117,6 +124,7 @@ async def nhentai_download(event):
     else:
         chapter_data = data
         chapter_info = ""
+        total_chapters = 1
     
     title = chapter_data.get("title", "NHentai")
     images = chapter_data.get("images", [])
@@ -143,28 +151,34 @@ async def nhentai_download(event):
                 f"`Progress: {int(progress)}% ({idx}/{total_images})`"
             )
     
+    if not images_data:
+        return await xx.edit("`Failed to download images.`")
+    
     await xx.edit("`Creating PDF...`")
-    pdf_buffer = await create_pdf_from_images(images_data, title)
+    pdf_file = await create_pdf_from_images(images_data, title)
     
-    if not pdf_buffer:
+    if not pdf_file:
         return await xx.edit("`Failed to create PDF.`")
-    
-    # Create filename
-    filename = f"{title[:50]}.pdf" if len(title) > 50 else f"{title}.pdf"
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
     
     # Prepare caption
     caption = f"**{title}**{chapter_info}\n`Pages: {len(images_data)}`"
-    if isinstance(data, list) and len(data) > 1:
-        caption += f"\n\n_Note: {len(data)} chapters available. Use same command for each chapter._"
+    if total_chapters > 1:
+        caption += f"\n\n_Note: {total_chapters} chapters available. Use same command for each chapter._"
     
-    await event.client.send_file(
-        event.chat_id,
-        pdf_buffer,
-        attributes=[],
-        force_document=True,
-        caption=caption,
-        reply_to=event.reply_to_msg_id
-    )
-    await xx.delete()
-    
+    try:
+        await event.client.send_file(
+            event.chat_id,
+            pdf_file,
+            force_document=True,
+            caption=caption,
+            reply_to=event.reply_to_msg_id
+        )
+        await xx.delete()
+    except Exception as e:
+        LOGS.error(f"Error sending file: {e}")
+        await xx.edit("`Failed to send PDF file.`")
+    finally:
+        # Clean up
+        if os.path.exists(pdf_file):
+            os.remove(pdf_file)
+            
